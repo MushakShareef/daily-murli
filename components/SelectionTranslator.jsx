@@ -1,173 +1,155 @@
-// components/SelectionTranslator.jsx
 import React, { useEffect, useRef, useState } from "react";
 
-/**
- * SelectionTranslator
- * - Attach this component somewhere near the root of your app (e.g. in pages/_app or pages/index)
- * - It listens to selections and shows a small translation popup near the selected text.
- */
+// SelectionTranslator.jsx
+// - Attach selection listeners and show a translation popup positioned intelligently
+// - Uses the free /api/translate endpoint in your project
+// - Positions popup above the Android/Chrome selection toolbar when necessary
+// - Reads latest `primaryLanguage` from a ref so listeners stay stable
 
-// Simple in-memory cache to avoid repeated calls
-const cache = new Map();
-const CACHE_MAX = 1000;
-function cacheSet(key, value) {
-  if (cache.has(key)) cache.delete(key);
-  cache.set(key, value);
-  while (cache.size > CACHE_MAX) {
-    const first = cache.keys().next().value;
-    cache.delete(first);
-  }
-}
-function cacheGet(key) {
-  const v = cache.get(key);
-  return v;
-}
-
-// Helper: clean the selected text (remove zero-width, BOM, collapse whitespace)
-function cleanSelectedText() {
-  if (typeof window === "undefined" || !window.getSelection) return "";
-  const sel = window.getSelection();
-  if (!sel) return "";
-  let s = sel.toString() || "";
-  s = s.trim();
-  s = s
-    .replace(/\u200B/g, "") // zero width space
-    .replace(/\u200C/g, "") // ZWNJ
-    .replace(/\u200D/g, "") // ZWJ
-    .replace(/\uFEFF/g, "") // BOM
-    .replace(/\u00A0/g, " ") // nbsp -> space
-    .replace(/[ \t\v\f\r]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  // if too short or contains replacement char, return empty
-  if (!s || s.length < 1 || /\uFFFD/.test(s)) return "";
-  return s;
-}
-
-export default function SelectionTranslator({ primaryLanguage = (process.env.NEXT_PUBLIC_PRIMARY_LANGUAGE || "Tamil") }) {
-  const [visible, setVisible] = useState(false);
-  const [pos, setPos] = useState({ top: 0, left: 0 });
-  const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState({ primary: "", english: "" });
+export default function SelectionTranslator({ primaryLanguage = "Tamil" }) {
+  const langRef = useRef(primaryLanguage);
   const popupRef = useRef(null);
-  const timerRef = useRef(null);
-  const lastKeyRef = useRef("");
+  const [visible, setVisible] = useState(false);
+  const [popupStyle, setPopupStyle] = useState({});
+  const [selectedText, setSelectedText] = useState("");
+  const [primaryTranslation, setPrimaryTranslation] = useState("");
+  const [englishTranslation, setEnglishTranslation] = useState("");
+  const [loading, setLoading] = useState(false);
+  const fetchController = useRef(null);
+  const debounceRef = useRef(null);
 
-  // debounce for selection (ms)
-  const DEBOUNCE = 300;
-
-  // cleanup on unmount
+  // keep a ref of the latest language so handlers don't close over stale value
   useEffect(() => {
-    return () => {
-      if (timerRef.current) clearTimeout(timerRef.current);
-    };
-  }, []);
+    langRef.current = primaryLanguage;
+  }, [primaryLanguage]);
 
-  // compute popup position near selection
-  function positionPopup(range) {
+  // Helper: get current selection rect
+  function getSelectionRect() {
     try {
-      const rect = range.getBoundingClientRect();
-      const scrollX = window.scrollX || window.pageXOffset;
-      const scrollY = window.scrollY || window.pageYOffset;
-      const popup = popupRef.current;
-      const popupW = popup ? popup.offsetWidth : 220;
-      const popupH = popup ? popup.offsetHeight : 110;
-      // prefer above selection unless near top
-      let top = rect.top + scrollY - popupH - 8;
-      if (top < 10) top = rect.bottom + scrollY + 8; // below selection
-      let left = rect.left + scrollX + rect.width / 2 - popupW / 2;
-      // keep inside viewport
-      const maxLeft = window.innerWidth + scrollX - popupW - 10;
-      if (left < 10) left = 10;
-      if (left > maxLeft) left = maxLeft;
-      setPos({ top: Math.round(top), left: Math.round(left) });
+      const sel = window.getSelection && window.getSelection();
+      if (!sel || sel.rangeCount === 0) return null;
+      const range = sel.getRangeAt(0).cloneRange();
+      let rect = range.getBoundingClientRect();
+      if (!rect || (rect.width === 0 && rect.height === 0)) {
+        const rects = range.getClientRects();
+        if (rects && rects.length) rect = rects[0];
+      }
+      if (!rect) return null;
+      return rect;
     } catch (e) {
-      // fallback center
-      setPos({ top: 120, left: 20 });
+      return null;
     }
   }
 
-  // send translate request
-  async function fetchTranslation(text, targetLanguage) {
-    const cacheKey = `${targetLanguage}::${text}`;
-    const cached = cacheGet(cacheKey);
-    if (cached) {
-      return cached;
+  function computePopupPosition(rect, popupWidth = 320, popupHeight = 160) {
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const ANDROID_SELECTION_OVERLAY_ESTIMATE = 90; // safe margin to avoid bottom toolbar
+    const MARGIN = 8;
+    const safeBottomSpace = vh - rect.bottom;
+    const safeTopSpace = rect.top;
+
+    let top;
+    let left = rect.left + rect.width / 2 - popupWidth / 2;
+    left = Math.max(8, Math.min(left, vw - popupWidth - 8));
+
+    if (safeBottomSpace > popupHeight + ANDROID_SELECTION_OVERLAY_ESTIMATE + MARGIN) {
+      top = window.scrollY + rect.bottom + MARGIN;
+    } else if (safeTopSpace > popupHeight + ANDROID_SELECTION_OVERLAY_ESTIMATE + MARGIN) {
+      top = window.scrollY + rect.top - popupHeight - MARGIN;
+    } else {
+      // fallback near top of viewport (below any fixed header)
+      top = window.scrollY + Math.min(rect.top, 80);
     }
 
+    return { top, left };
+  }
+
+  // Utility: normalize selected text
+  function normalizeSelectionText(s) {
+    if (!s) return "";
+    return s.replace(/\s+/g, " ").trim();
+  }
+
+  // Call translate API (debounced). Returns {primary, english}
+  async function translateText(text, targetLanguage) {
+    if (!text) return null;
     try {
+      if (fetchController.current) {
+        fetchController.current.abort();
+      }
+      fetchController.current = new AbortController();
+      setLoading(true);
+
       const resp = await fetch("/api/translate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text, targetLanguage })
+        body: JSON.stringify({ text, targetLanguage }),
+        signal: fetchController.current.signal,
       });
-      const j = await resp.json();
-      const primary = j.primaryTranslation || j.primary || j.primaryLang || (j.body && j.body.primaryTranslation) || "";
-      const english = j.englishTranslation || j.english || j.englishLang || "";
-      const out = { primary: String(primary).trim(), english: String(english).trim() };
-      cacheSet(cacheKey, out);
-      return out;
+
+      const json = await resp.json();
+      setLoading(false);
+      return json;
     } catch (err) {
-      console.error("translate fetch failed", err);
-      return { primary: `${targetLanguage} (fallback): ${text}`, english: `English (fallback): ${text}` };
+      setLoading(false);
+      return null;
     }
   }
 
-  // main handler triggered on mouseup / touchend / keyboard
-  function handleSelectionEvent() {
-    if (timerRef.current) clearTimeout(timerRef.current);
-    timerRef.current = setTimeout(async () => {
-      const selected = cleanSelectedText();
-      if (!selected) {
+  // Main handler when selection changes
+  async function handleSelectionEvent() {
+    // small debounce to avoid multiple rapid calls on mobile
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(async () => {
+      const sel = window.getSelection && window.getSelection();
+      if (!sel) {
+        setVisible(false);
+        return;
+      }
+      const text = normalizeSelectionText(sel.toString());
+      if (!text) {
         setVisible(false);
         return;
       }
 
-      // avoid duplicate requests for same text
-      if (lastKeyRef.current === selected) {
-        // if popup already visible and results present, just return
-        if (visible) return;
-      }
-      lastKeyRef.current = selected;
-
-      // find selection range for positioning
-      let range;
-      try {
-        const sel = window.getSelection();
-        if (!sel || sel.rangeCount === 0) {
-          setVisible(false);
-          return;
-        }
-        range = sel.getRangeAt(0).cloneRange();
-      } catch (e) {
-        range = null;
+      const rect = getSelectionRect();
+      if (!rect) {
+        setVisible(false);
+        return;
       }
 
-      // position popup
-      if (range) positionPopup(range);
+      // compute popup position
+      const popupWidth = Math.min(360, window.innerWidth - 24);
+      const popupHeight = 160;
+      const pos = computePopupPosition(rect, popupWidth, popupHeight);
+      setPopupStyle({ position: "absolute", top: `${pos.top}px`, left: `${pos.left}px`, width: `${popupWidth}px`, zIndex: 2147483647 });
 
-      // show loading popup
-      setLoading(true);
+      setSelectedText(text);
       setVisible(true);
-      setResult({ primary: "", english: "" });
 
-      // fetch translation
-      const out = await fetchTranslation(selected, primaryLanguage);
-      setResult(out);
-      setLoading(false);
-    }, DEBOUNCE);
+      // call translation API
+      const target = langRef.current || primaryLanguage;
+      const result = await translateText(text, target);
+      if (result) {
+        setPrimaryTranslation(result.primaryTranslation || result.primary || "");
+        setEnglishTranslation(result.englishTranslation || result.english || "");
+      } else {
+        setPrimaryTranslation("");
+        setEnglishTranslation("");
+      }
+    }, 120);
   }
 
-  // attach listeners
-      useEffect(() => {
-    // use capture to get events before other handlers
-    function onMouseUp(e) { handleSelectionEvent(); }
+  // Attach stable listeners that read latest language from ref
+  useEffect(() => {
+    function onMouseUp(e) {
+      handleSelectionEvent();
+    }
     function onTouchEnd(e) {
-      // wait a tiny bit after touchend for selection to settle
       setTimeout(() => handleSelectionEvent(), 150);
     }
     function onKeyUp(e) {
-      // allow keyboard selection (shift+arrows)
       if (e.key === "Enter" || e.key === " ") return;
       handleSelectionEvent();
     }
@@ -176,89 +158,75 @@ export default function SelectionTranslator({ primaryLanguage = (process.env.NEX
     document.addEventListener("touchend", onTouchEnd, true);
     document.addEventListener("keyup", onKeyUp, true);
 
+    // hide popup on scroll/resize to avoid misplacement; could also reposition
+    function onScrollResize() {
+      setVisible(false);
+    }
+    window.addEventListener("scroll", onScrollResize, true);
+    window.addEventListener("resize", onScrollResize);
+
+    // click outside to close
+    function onDocClick(e) {
+      if (!popupRef.current) return;
+      if (!popupRef.current.contains(e.target)) {
+        setVisible(false);
+      }
+    }
+    document.addEventListener("click", onDocClick, true);
+
     return () => {
       document.removeEventListener("mouseup", onMouseUp, true);
       document.removeEventListener("touchend", onTouchEnd, true);
       document.removeEventListener("keyup", onKeyUp, true);
+      window.removeEventListener("scroll", onScrollResize, true);
+      window.removeEventListener("resize", onScrollResize);
+      document.removeEventListener("click", onDocClick, true);
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      if (fetchController.current) fetchController.current.abort();
     };
-  }, [primaryLanguage]);
+    // intentionally no deps so listeners are stable; latest language read from ref
+  }, []);
 
-
-
-  // hide popup when clicking outside it
-  useEffect(() => {
-    function onDocClick(e) {
-      if (!visible) return;
-      const p = popupRef.current;
-      if (!p) return;
-      if (!p.contains(e.target)) {
-        setVisible(false);
-      }
-    }
-    document.addEventListener("mousedown", onDocClick);
-    return () => document.removeEventListener("mousedown", onDocClick);
-  }, [visible]);
-
-  // render nothing if not visible
+  // small UI: popup content
   return (
     <>
       {visible && (
-        <div
-          ref={popupRef}
-          role="dialog"
-          aria-live="polite"
-          style={{
-            position: "absolute",
-            zIndex: 99999,
-            top: pos.top,
-            left: pos.left,
-            width: 260,
-            maxWidth: "90vw",
-            background: "#fff",
-            color: "#000",
-            border: "1px solid #E0E0E0",
-            borderRadius: 8,
-            boxShadow: "0 6px 18px rgba(0,0,0,0.12)",
-            padding: 10,
-            fontFamily: "'Noto Sans Devanagari', sans-serif",
-            fontSize: 14,
-            lineHeight: "1.4",
-            pointerEvents: "auto"
-          }}
-        >
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-            <div style={{ fontSize: 12, color: "#666" }}>{/* small label */}Selected</div>
-            <button
-              aria-label="Close translation"
-              onClick={() => setVisible(false)}
-              style={{
-                border: "none",
-                background: "transparent",
-                color: "#444",
-                fontSize: 14,
-                cursor: "pointer",
-                padding: 4,
-                marginLeft: 8
-              }}
-            >
-              ×
-            </button>
-          </div>
+        <div ref={popupRef} style={popupStyle} className="selection-translate-popup">
+          <div style={{ padding: 12, background: "#fff", borderRadius: 8, boxShadow: "0 8px 24px rgba(0,0,0,0.12)", pointerEvents: "auto" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+              <div style={{ fontSize: 12, color: "#666" }}>Selected</div>
+              <button onClick={() => setVisible(false)} style={{ background: "transparent", border: "none", cursor: "pointer", fontSize: 16 }}>×</button>
+            </div>
 
-          <div style={{ fontSize: 12, color: "#444", marginBottom: 6, whiteSpace: "pre-wrap" }}>
-            {/* show original smaller */}
-            {loading ? <i>translating...</i> : <>{/* original text not shown to keep design minimal */}</>}
-          </div>
+            <div style={{ minHeight: 44 }}>
+              <div style={{ fontSize: 18, fontWeight: 700 }}>{loading ? "Translating..." : (primaryTranslation || "(no translation)")}</div>
+              {englishTranslation && (
+                <div style={{ marginTop: 6, color: "#666", fontSize: 13 }}>{englishTranslation}</div>
+              )}
+            </div>
 
-          <div style={{ fontWeight: 600, fontSize: 15, marginBottom: 6 }}>
-            {loading ? "…" : (result.primary || `${primaryLanguage} (fallback)`)}
-          </div>
+            <div style={{ marginTop: 10, display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button onClick={() => {
+                if (!selectedText) return;
+                // copy primary translation or original
+                const textToCopy = primaryTranslation || selectedText;
+                navigator.clipboard && navigator.clipboard.writeText(textToCopy);
+              }} style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #ddd", background: "#fff" }}>
+                Copy
+              </button>
 
-          <div style={{ fontSize: 13, color: "#444" }}>
-            <small style={{ color: "#666" }}>{loading ? "" : (result.english || "English (fallback)")} </small>
+              <a href={`https://translate.google.com/?sl=auto&tl=${encodeURIComponent(langRef.current||primaryLanguage)}&text=${encodeURIComponent(selectedText)}&op=translate`} target="_blank" rel="noreferrer" style={{ padding: "6px 10px", borderRadius: 6, background: "#111", color: "#fff", textDecoration: "none" }}>Open in Google</a>
+            </div>
           </div>
         </div>
       )}
+
+      <style jsx>{`
+        .selection-translate-popup { pointer-events: auto; }
+        @media (max-width: 600px) {
+          .selection-translate-popup { width: calc(100% - 24px) !important; left: 12px !important; }
+        }
+      `}</style>
     </>
   );
 }
