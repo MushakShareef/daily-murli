@@ -26,7 +26,6 @@ export default function Home({ murli, usedDate }) {
             <div dangerouslySetInnerHTML={{ __html: murli.content }} />
             {murli.metadata && (
               <div style={{ marginTop: 12, color: "#777", fontSize: 13 }}>
-                {/* optional display of metadata */}
                 {typeof murli.metadata === "object" ? JSON.stringify(murli.metadata) : String(murli.metadata)}
               </div>
             )}
@@ -41,43 +40,58 @@ export default function Home({ murli, usedDate }) {
   );
 }
 
+// Server-side only: call Supabase REST API directly using the service role key.
+// This keeps the secret server-side (do NOT use NEXT_PUBLIC_ env for the key).
 export async function getServerSideProps(context) {
-  // build absolute base url for SSR fetch
-  const VERCEL_URL = process.env.VERCEL_URL;
-  const baseUrl = VERCEL_URL ? `https://${VERCEL_URL}` : `http://localhost:3000`;
+  const SUPABASE_URL = process.env.SUPABASE_URL;
+  const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-  // server-side today (uses server time)
   const today = formatDateYYYYMMDD(new Date());
 
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    console.error("Supabase envs missing in getServerSideProps");
+    return { props: { murli: null, usedDate: today } };
+  }
+
+  const base = SUPABASE_URL.replace(/\/$/, "");
+  // Helper to perform supabase rest query
+  async function supabaseGet(qs) {
+    const url = `${base}/rest/v1/murlis${qs}`;
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        "Content-Type": "application/json",
+      },
+    });
+    const text = await resp.text();
+    try {
+      return { ok: resp.ok, status: resp.status, json: JSON.parse(text) };
+    } catch {
+      return { ok: resp.ok, status: resp.status, json: null, text };
+    }
+  }
+
   try {
-    // try date-specific first
-    let resp = await fetch(`${baseUrl}/api/murli?date=${encodeURIComponent(today)}`, {
-      method: "GET",
-      headers: { "Content-Type": "application/json" },
-    });
-
-    if (resp.ok) {
-      const data = await resp.json();
-      return { props: { murli: data || null, usedDate: today } };
+    // 1) Try today
+    const todayQs = `?select=*,created_at&date=eq.${encodeURIComponent(today)}&limit=1`;
+    const tryToday = await supabaseGet(todayQs);
+    if (tryToday.ok && Array.isArray(tryToday.json) && tryToday.json.length) {
+      return { props: { murli: tryToday.json[0], usedDate: today } };
     }
 
-    // if date-specific not available (404 or not ok), fallback to latest
-    resp = await fetch(`${baseUrl}/api/murli`, {
-      method: "GET",
-      headers: { "Content-Type": "application/json" },
-    });
-
-    if (resp.ok) {
-      const data = await resp.json();
-      // find display date: prefer murli.date, else today's date
-      const displayDate = (data && data.date) ? data.date : today;
-      return { props: { murli: data || null, usedDate: displayDate } };
+    // 2) Fallback to latest
+    const latestQs = `?select=*,created_at&order=created_at.desc&limit=1`;
+    const latest = await supabaseGet(latestQs);
+    if (latest.ok && Array.isArray(latest.json) && latest.json.length) {
+      const displayDate = latest.json[0].date || today;
+      return { props: { murli: latest.json[0], usedDate: displayDate } };
     }
 
-    // final fallback
     return { props: { murli: null, usedDate: today } };
   } catch (err) {
-    console.error("getServerSideProps fetch error:", err);
+    console.error("getServerSideProps Supabase fetch error:", String(err));
     return { props: { murli: null, usedDate: today } };
   }
 }
