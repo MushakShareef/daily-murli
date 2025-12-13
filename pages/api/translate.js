@@ -69,45 +69,48 @@ function applyTamilDictionary(text) {
   return null;
 }
 
+function isParagraph(text) {
+  return (
+    text.includes(" ") ||       // more than one word
+    text.includes("\n") ||      // multi-line
+    text.length > 25            // long sentence
+  );
+}
 
+async function callGoogleTranslate(text, source = "hi", target = "en") {
+  const cleanText = text
+    .replace(/\n+/g, " ")       // normalize newlines
+    .replace(/\s+/g, " ")       // normalize spaces
+    .trim();
 
+  const encoded = encodeURIComponent(cleanText);
 
+  // IMPORTANT: dt=t ONLY (no dictionary flags)
+  const url =
+    `https://translate.googleapis.com/translate_a/single` +
+    `?client=gtx&sl=${source}&tl=${target}&dt=t&q=${encoded}`;
 
-async function callGoogleTranslateAuto(text, source = "auto", target = "en") {
-  // source: 'auto' to auto-detect; target: language code (ta/te/kn/ml/en)
-  const encoded = encodeURIComponent(text);
-  const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${source}&tl=${target}&dt=t&q=${encoded}`;
-  const resp = await fetch(url, { method: "GET" });
-  const contentType = resp.headers.get("content-type") || "";
+  const resp = await fetch(url);
   const textResp = await resp.text();
 
-  // The endpoint normally returns a JSON array. Try to parse.
   let json = null;
   try {
     json = JSON.parse(textResp);
-  } catch (e) {
-    // not JSON — keep raw text for debugging
-  }
-  return { status: resp.status, contentType, textResp, json };
+  } catch {}
+
+  return { status: resp.status, json };
 }
 
+
 function extractTranslationFromGoogleArray(arr) {
-  // Expected shape: [ [ [translatedText, originalText, ...], ... ], ... ]
-  // We'll join the first element's pieces
-  try {
-    if (!Array.isArray(arr)) return "";
-    const first = arr[0];
-    if (!Array.isArray(first)) return "";
-    // first is list of segments: [ [translated, original, ...], ... ]
-    const parts = first.map((seg) => {
-      if (Array.isArray(seg) && seg.length > 0) return seg[0];
-      return "";
-    });
-    return parts.join("");
-  } catch (e) {
-    return "";
-  }
+  if (!Array.isArray(arr) || !Array.isArray(arr[0])) return "";
+
+  return arr[0]
+    .map(segment => Array.isArray(segment) ? segment[0] : "")
+    .join("")
+    .trim();
 }
+
 
 function isMostlyLatin(s) {
   if (!s || typeof s !== "string") return false;
