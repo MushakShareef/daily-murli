@@ -1,5 +1,7 @@
 // pages/index.jsx
 import React from "react";
+import SelectionTranslator from "../components/SelectionTranslator";
+
 
 function formatDateYYYYMMDD(d) {
   const y = d.getFullYear();
@@ -36,6 +38,7 @@ export default function Home({ murli, usedDate }) {
           </div>
         )}
       </main>
+      <SelectionTranslator />
     </div>
   );
 }
