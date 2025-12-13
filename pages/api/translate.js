@@ -103,14 +103,22 @@ async function callGoogleTranslate(text, source = "hi", target = "en") {
 
 
 function extractTranslationFromGoogleArray(arr) {
-  if (!Array.isArray(arr) || !Array.isArray(arr[0])) return "";
-
-  return arr[0]
-    .map(segment => Array.isArray(segment) ? segment[0] : "")
-    .join("")
-    .trim();
+  // Expected shape: [ [ [translatedText, originalText, ...], ... ], ... ]
+  // We'll join the first element's pieces
+  try {
+    if (!Array.isArray(arr)) return "";
+    const first = arr[0];
+    if (!Array.isArray(first)) return "";
+    // first is list of segments: [ [translated, original, ...], ... ]
+    const parts = first.map((seg) => {
+      if (Array.isArray(seg) && seg.length > 0) return seg[0];
+      return "";
+    });
+    return parts.join("");
+  } catch (e) {
+    return "";
+  }
 }
-
 
 function isMostlyLatin(s) {
   if (!s || typeof s !== "string") return false;
