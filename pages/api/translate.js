@@ -1,11 +1,12 @@
 // pages/api/translate.js
-// Free Google Translate endpoint handler (improved)
+// Free Google Translate endpoint handler (improved, FIXED)
 // - POST { text, targetLanguage } -> { primaryTranslation, englishTranslation, debug? }
 // - Supports: Tamil, English, Telugu, Kannada, Malayalam
 // - Uses translate.googleapis.com (no API key)
-// - Auto-detects source language and chains via English if transliteration detected
-// - Simple in-memory cache for dev
-// --- Step 1: Custom Tamil Dictionary ---
+// - Preserves custom dictionary + cache + debug
+
+/* -------------------- STEP 1: Custom Tamil Dictionary -------------------- */
+
 const TAMIL_DICTIONARY = {
   "अमरलोक": "அமரலகம்",
   "मृत्युलोक": "மரண உலகம்",
@@ -25,8 +26,10 @@ const TAMIL_DICTIONARY = {
   "कर्म": "கர்மம்",
 };
 
+/* -------------------- Cache -------------------- */
+
 const CACHE_MAX_ENTRIES = 500;
-const cache = new Map(); // simple in-memory cache: key -> { primary, english, ts }
+const cache = new Map();
 
 function cacheKey(text, targetLang) {
   return `${targetLang}::${text}`;
@@ -34,7 +37,6 @@ function cacheKey(text, targetLang) {
 
 function cacheSet(key, value) {
   if (cache.size >= CACHE_MAX_ENTRIES) {
-    // delete oldest (Map preserves insertion order) — simple eviction
     const firstKey = cache.keys().next().value;
     cache.delete(firstKey);
   }
@@ -42,10 +44,10 @@ function cacheSet(key, value) {
 }
 
 function cacheGet(key) {
-  const v = cache.get(key);
-  if (!v) return null;
-  return v;
+  return cache.get(key) || null;
 }
+
+/* -------------------- Language Helpers -------------------- */
 
 function langToCode(lang) {
   if (!lang || typeof lang !== "string") return "en";
@@ -55,37 +57,38 @@ function langToCode(lang) {
   if (l === "kannada" || l === "kn") return "kn";
   if (l === "malayalam" || l === "ml") return "ml";
   if (l === "english" || l === "en") return "en";
-  // default: English
   return "en";
 }
 
+/* -------------------- Text Helpers -------------------- */
+
+function isParagraph(text) {
+  return text.includes(" ") || text.includes("\n") || text.length > 25;
+}
+
+function isMostlyLatin(s) {
+  if (!s) return false;
+  const cleaned = s.replace(/[\s\p{P}\p{S}]/gu, "");
+  if (!cleaned) return false;
+  const latin = (cleaned.match(/[A-Za-z]/g) || []).length;
+  return latin / cleaned.length > 0.4;
+}
+
 function applyTamilDictionary(text) {
-  const keys = Object.keys(TAMIL_DICTIONARY);
-  for (const key of keys) {
-    if (text.includes(key)) {
+  for (const key of Object.keys(TAMIL_DICTIONARY)) {
+    if (text.trim() === key) {
       return TAMIL_DICTIONARY[key];
     }
   }
   return null;
 }
 
-function isParagraph(text) {
-  return (
-    text.includes(" ") ||       // more than one word
-    text.includes("\n") ||      // multi-line
-    text.length > 25            // long sentence
-  );
-}
+/* -------------------- Google Translate -------------------- */
 
-async function callGoogleTranslate(text, source = "hi", target = "en") {
-  const cleanText = text
-    .replace(/\n+/g, " ")       // normalize newlines
-    .replace(/\s+/g, " ")       // normalize spaces
-    .trim();
-
+async function callGoogleTranslate(text, source = "auto", target = "en") {
+  const cleanText = text.replace(/\n+/g, " ").replace(/\s+/g, " ").trim();
   const encoded = encodeURIComponent(cleanText);
 
-  // IMPORTANT: dt=t ONLY (no dictionary flags)
   const url =
     `https://translate.googleapis.com/translate_a/single` +
     `?client=gtx&sl=${source}&tl=${target}&dt=t&q=${encoded}`;
@@ -101,160 +104,93 @@ async function callGoogleTranslate(text, source = "hi", target = "en") {
   return { status: resp.status, json };
 }
 
+/* ✅ MISSING FUNCTION — THIS WAS THE MAIN BUG */
+async function callGoogleTranslateAuto(text, source, target) {
+  return callGoogleTranslate(text, source, target);
+}
 
 function extractTranslationFromGoogleArray(arr) {
-  // Expected shape: [ [ [translatedText, originalText, ...], ... ], ... ]
-  // We'll join the first element's pieces
-  try {
-    if (!Array.isArray(arr)) return "";
-    const first = arr[0];
-    if (!Array.isArray(first)) return "";
-    // first is list of segments: [ [translated, original, ...], ... ]
-    const parts = first.map((seg) => {
-      if (Array.isArray(seg) && seg.length > 0) return seg[0];
-      return "";
-    });
-    return parts.join("");
-  } catch (e) {
-    return "";
-  }
+  if (!Array.isArray(arr) || !Array.isArray(arr[0])) return "";
+  return arr[0]
+    .map(seg => (Array.isArray(seg) ? seg[0] : ""))
+    .join("")
+    .trim();
 }
 
-function isMostlyLatin(s) {
-  if (!s || typeof s !== "string") return false;
-  // remove spaces and punctuation for ratio
-  const cleaned = s.replace(/[\s\p{P}\p{S}]/gu, "");
-  if (!cleaned) return false;
-  const latinMatches = cleaned.match(/[A-Za-z]/g) || [];
-  const latinCount = latinMatches.length;
-  const total = cleaned.length;
-  return (latinCount / total) > 0.4; // if >40% latin -> likely transliteration/roman
-}
+/* -------------------- Handler -------------------- */
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
 
   const { text, targetLanguage } = req.body || {};
-  // --- CUSTOM DICTIONARY CHECK (Tamil only) ---
-        if (targetLanguage.toLowerCase() === "tamil") {
-        const dictMatch = applyTamilDictionary(text.trim());
-        if (dictMatch) {
-            return res.status(200).json({
-            primaryTranslation: dictMatch,
-            englishTranslation: "Dictionary-based translation",
-            debug: { dictionaryHit: true }
-            });
-        }
-        }
+
   if (!text || typeof text !== "string" || !text.trim()) {
     return res.status(400).json({ error: "Missing text" });
   }
 
-  // map language name to code
   const targetCode = langToCode(targetLanguage);
   const cacheK = cacheKey(text, targetCode);
 
-  // Return cached if available
   const cached = cacheGet(cacheK);
   if (cached) {
     return res.status(200).json({
       primaryTranslation: cached.primary,
       englishTranslation: cached.english,
-      debug: { cached: true, ts: cached.ts }
+      debug: { cached: true },
     });
   }
 
   try {
-    // 1) Primary translation (auto-detect -> target)
-    const callPrimary = await callGoogleTranslateAuto(text, "auto", targetCode);
-
-    // 2) English translation (auto-detect -> en)
-    let callEnglish;
-    if (targetCode === "en") {
-      callEnglish = callPrimary;
-    } else {
-      callEnglish = await callGoogleTranslateAuto(text, "auto", "en");
+    /* ---- Dictionary ONLY for single-word Tamil ---- */
+    if (
+      targetCode === "ta" &&
+      !isParagraph(text)
+    ) {
+      const dictHit = applyTamilDictionary(text);
+      if (dictHit) {
+        const result = {
+          primaryTranslation: dictHit,
+          englishTranslation: "Dictionary-based translation",
+        };
+        cacheSet(cacheK, result);
+        return res.status(200).json(result);
+      }
     }
 
-    // Extract primaryText
-    let primaryText = "";
-    if (callPrimary.json) {
+    /* ---- English (always) ---- */
+    const callEnglish = await callGoogleTranslateAuto(text, "auto", "en");
+    const englishText = extractTranslationFromGoogleArray(callEnglish.json);
+
+    /* ---- Primary target ---- */
+    let primaryText = englishText;
+    if (targetCode !== "en") {
+      const callPrimary = await callGoogleTranslateAuto(text, "auto", targetCode);
       primaryText = extractTranslationFromGoogleArray(callPrimary.json);
-    } else if (callPrimary.status === 200 && typeof callPrimary.textResp === "string") {
-      try {
-        const parsed = JSON.parse(callPrimary.textResp);
-        primaryText = extractTranslationFromGoogleArray(parsed);
-      } catch (_e) {
-        primaryText = callPrimary.textResp.slice(0, 1000);
-      }
-    } else {
-      primaryText = "";
-    }
 
-    // Extract englishText
-    let englishText = "";
-    if (callEnglish && callEnglish.json) {
-      englishText = extractTranslationFromGoogleArray(callEnglish.json);
-    } else if (callEnglish && callEnglish.status === 200 && typeof callEnglish.textResp === "string") {
-      try {
-        const parsed = JSON.parse(callEnglish.textResp);
-        englishText = extractTranslationFromGoogleArray(parsed);
-      } catch (_e) {
-        englishText = callEnglish.textResp.slice(0, 1000);
-      }
-    } else {
-      englishText = "";
-    }
-
-    // If primary looks like transliteration (latin-heavy) and englishText exists and target is not English,
-    // try chain: englishText -> targetCode (en -> ta/ml/te/kn)
-    if (isMostlyLatin(primaryText) && englishText && englishText.trim().length > 0 && targetCode !== "en") {
-      const chainCall = await callGoogleTranslateAuto(englishText, "en", targetCode);
-      let chainText = "";
-      if (chainCall && chainCall.json) {
-        chainText = extractTranslationFromGoogleArray(chainCall.json);
-      } else if (chainCall && chainCall.status === 200 && typeof chainCall.textResp === "string") {
-        try {
-          const parsed = JSON.parse(chainCall.textResp);
-          chainText = extractTranslationFromGoogleArray(parsed);
-        } catch (e) {
-          chainText = chainCall.textResp.slice(0, 1000);
+      // transliteration chain fix
+      if (isMostlyLatin(primaryText) && englishText) {
+        const chain = await callGoogleTranslateAuto(englishText, "en", targetCode);
+        const chained = extractTranslationFromGoogleArray(chain.json);
+        if (chained && !isMostlyLatin(chained)) {
+          primaryText = chained;
         }
       }
-      // if chain produced a non-latin result, use it
-      if (chainText && !isMostlyLatin(chainText)) {
-        primaryText = chainText;
-      }
     }
 
-    // Final fallback: if empty use fallback string
-    if (!primaryText || primaryText.trim().length === 0) {
-      primaryText = `${targetLanguage} (fallback): ${text}`;
-    }
-    if (!englishText || englishText.trim().length === 0) {
-      englishText = `English (fallback): ${text}`;
-    }
+    const result = {
+      primaryTranslation: primaryText || englishText,
+      englishTranslation: englishText || text,
+    };
 
-    // Cache
-    cacheSet(cacheK, { primary: primaryText, english: englishText });
-
-    // Return result with debug info
-    return res.status(200).json({
-      primaryTranslation: primaryText,
-      englishTranslation: englishText,
-      debug: {
-        apiStatusPrimary: callPrimary && callPrimary.status,
-        apiStatusEnglish: callEnglish && callEnglish.status,
-        apiContentTypePrimary: callPrimary && callPrimary.contentType,
-        apiContentTypeEnglish: callEnglish && callEnglish.contentType
-      }
-    });
+    cacheSet(cacheK, result);
+    return res.status(200).json(result);
   } catch (err) {
-    console.error("translate handler error (google free improved):", err && (err.stack || err.message || err));
+    console.error("translate error:", err);
     return res.status(200).json({
       primaryTranslation: `${targetLanguage} (fallback): ${text}`,
       englishTranslation: `English (fallback): ${text}`,
-      debugError: String(err)
     });
   }
 }
