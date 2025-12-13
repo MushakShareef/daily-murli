@@ -91,23 +91,22 @@ export default function Home() {
 
         {murli && (
           <div>
-            <div
-              style={{ whiteSpace: "pre-wrap" }}
-              dangerouslySetInnerHTML={{ __html: murli.content }}
-            />
-            {murli.metadata && (
-              <div
-                style={{
-                  marginTop: 12,
-                  color: "#777",
-                  fontSize: 13,
-                }}
-              >
-                {typeof murli.metadata === "object"
-                  ? JSON.stringify(murli.metadata)
-                  : String(murli.metadata)}
-              </div>
-            )}
+            <div style={{ marginTop: 16 }}>
+            {murli.content
+              .split(/\n\s*\n/)   // split on blank lines
+              .map((para, idx) => (
+                <p
+                  key={idx}
+                  style={{
+                    lineHeight: "1.8",
+                    marginBottom: 14,
+                    textAlign: "justify",
+                  }}
+                >
+                  {para.trim()}
+                </p>
+              ))}
+          </div>
           </div>
         )}
       </main>
